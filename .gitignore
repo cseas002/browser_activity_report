@@ -1,3 +1,4 @@
-raw/*
-processed/*
+data/raw/*
+data/processed/*
 reports/*
+.DS_Store
