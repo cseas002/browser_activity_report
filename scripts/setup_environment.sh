@@ -111,6 +111,7 @@ else
     $PIP_CMD install pandas matplotlib seaborn
     $PIP_CMD install browserhistory
     $PIP_CMD install requests beautifulsoup4 lxml
+    $PIP_CMD install lz4  # For Firefox session file decompression
 fi
 
 echo "Python dependencies installed successfully."
@@ -127,6 +128,29 @@ if [[ "$OS" == "linux" ]]; then
     
     # Install forensics tools
     sudo apt-get install -y exiftool
+    
+    # Install Firefox forensics tools
+    echo "Installing Firefox forensics tools..."
+    sudo apt-get install -y sqlite3 mozlz4-tools
+    
+    # Install Rust for additional tools
+    if ! command_exists cargo; then
+        echo "Installing Rust..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source ~/.cargo/env
+    fi
+    
+    # Install firefed (Firefox forensics tool)
+    if ! command_exists firefed; then
+        echo "Installing firefed..."
+        cargo install firefed
+    fi
+    
+    # Install dumpzilla
+    if ! command_exists dumpzilla; then
+        echo "Installing dumpzilla..."
+        sudo apt-get install -y dumpzilla
+    fi
     
     # Install development tools
     sudo apt-get install -y git curl wget

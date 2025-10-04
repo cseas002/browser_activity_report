@@ -22,10 +22,30 @@ import csv
 import shutil
 import platform
 import argparse
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 import plistlib
 import struct
+import lz4.block  # For Firefox session file decompression
+
+# Import our Firefox forensics tools
+try:
+    import sys
+    sys.path.append(str(Path(__file__).parent.parent))
+    from tools.firefox_forensics.firefox_forensics import FirefoxForensics
+    from tools.firefox_forensics.advanced_recovery import AdvancedFirefoxRecovery
+    FIREFOX_FORENSICS_AVAILABLE = True
+except ImportError as e:
+    FIREFOX_FORENSICS_AVAILABLE = False
+    logging.warning(f"Firefox forensics tools not available: {e}. Some recovery features will be limited.")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 class BrowserExtractor:
     """Main class for extracting browser artifacts."""
@@ -40,6 +60,56 @@ class BrowserExtractor:
             'safari': 978307200  # Safari uses seconds since 2001-01-01
         }
 
+    def get_firefox_profile_path(self):
+        """Get the default Firefox profile path by reading profiles.ini."""
+        possible_locations = [
+            Path.home() / ".mozilla" / "firefox",  # Standard Linux
+            Path.home() / "snap" / "firefox" / "common" / ".mozilla" / "firefox",  # Ubuntu Snap
+            Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles",  # macOS
+            Path(os.environ.get('APPDATA', '')) / "Mozilla" / "Firefox" / "Profiles"  # Windows
+        ]
+
+        for location in possible_locations:
+            profiles_ini = location / "profiles.ini"
+            if profiles_ini.exists():
+                try:
+                    # Read profiles.ini
+                    with open(profiles_ini, 'r') as f:
+                        lines = f.readlines()
+                    
+                    # Parse for default profile
+                    current_section = None
+                    profile_path = None
+                    is_relative = None
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith('['):
+                            current_section = line[1:-1]
+                        elif current_section and current_section.startswith('Profile'):
+                            if line.startswith('Path='):
+                                profile_path = line[5:]
+                            elif line.startswith('IsRelative='):
+                                is_relative = line[11:] == '1'
+                            elif line.startswith('Default=1'):
+                                if profile_path:
+                                    if is_relative:
+                                        return location / profile_path
+                                    else:
+                                        return Path(profile_path)
+                    
+                    # If no default profile found but we have a path, use the first one
+                    if profile_path:
+                        if is_relative:
+                            return location / profile_path
+                        else:
+                            return Path(profile_path)
+                except Exception as e:
+                    print(f"Warning: Error reading Firefox profiles.ini: {e}")
+                    continue
+        
+        return None
+
     def get_browser_paths(self):
         """Get default browser profile paths for different operating systems."""
         paths = {}
@@ -47,24 +117,25 @@ class BrowserExtractor:
         if self.system == "windows":
             paths = {
                 'chrome': Path(os.environ.get('LOCALAPPDATA', '')) / "Google" / "Chrome" / "User Data" / "Default",
-                'firefox': Path(os.environ.get('APPDATA', '')) / "Mozilla" / "Firefox" / "Profiles",
                 'edge': Path(os.environ.get('LOCALAPPDATA', '')) / "Microsoft" / "Edge" / "User Data" / "Default",
                 'safari': None  # Safari not available on Windows
             }
         elif self.system == "darwin":  # macOS
             paths = {
                 'chrome': Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "Default",
-                'firefox': Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles",
                 'safari': Path.home() / "Library" / "Safari",
                 'edge': None  # Edge path on macOS if installed
             }
         elif self.system == "linux":
             paths = {
                 'chrome': Path.home() / ".config" / "google-chrome" / "Default",
-                'firefox': Path.home() / ".mozilla" / "firefox",
                 'safari': None,  # Safari not available on Linux
                 'edge': None
             }
+
+        # Add Firefox path from profiles.ini
+        firefox_path = self.get_firefox_profile_path()
+        paths['firefox'] = firefox_path if firefox_path else Path.home() / ".mozilla" / "firefox"
 
         return paths
 
@@ -78,10 +149,28 @@ class BrowserExtractor:
 
     def firefox_timestamp_to_datetime(self, timestamp):
         """Convert Firefox timestamp to datetime."""
-        if timestamp == 0:
+        if timestamp is None or timestamp == 0:
             return None
-        # Firefox uses microseconds since 1970-01-01
-        return datetime.fromtimestamp(timestamp / 1000000)
+        try:
+            # Firefox uses microseconds since 1970-01-01
+            # Handle both integer and float timestamps
+            if isinstance(timestamp, float):
+                pass  # Already a float
+            elif isinstance(timestamp, int):
+                timestamp = float(timestamp)
+            else:
+                timestamp = float(timestamp)
+
+            # Sanity check - ignore timestamps too far in the future
+            max_year = 2100  # Reasonable maximum year
+            max_timestamp = (datetime(max_year, 1, 1) - datetime(1970, 1, 1)).total_seconds() * 1000000
+            if timestamp > max_timestamp:
+                return None
+
+            return datetime.fromtimestamp(timestamp / 1000000)
+        except (ValueError, TypeError, OSError) as e:
+            print(f"Warning: Invalid Firefox timestamp: {timestamp} ({str(e)})")
+            return None
 
     def safari_timestamp_to_datetime(self, timestamp):
         """Convert Safari timestamp to datetime."""
@@ -314,49 +403,208 @@ class BrowserExtractor:
 
         return cookies_data
 
+    def extract_firefox_session_history(self, profile_path):
+        """Extract history from Firefox session backups."""
+        deleted_history = []
+        session_dir = profile_path / "sessionstore-backups"
+        
+        if not session_dir.exists():
+            return deleted_history
+
+        # Look for session backup files
+        backup_files = [
+            session_dir / "recovery.jsonlz4",
+            session_dir / "recovery.baklz4",
+            session_dir / "previous.jsonlz4"
+        ]
+
+        current_urls = set()  # Track URLs we've already seen
+        
+        for backup_file in backup_files:
+            if not backup_file.exists():
+                continue
+
+            try:
+                # Read LZ4 compressed session file
+                with open(backup_file, 'rb') as f:
+                    # Skip Mozilla LZ4 header (8 bytes "mozLz40\0" + 4 bytes size)
+                    header = f.read(8)
+                    if header != b'mozLz40\0':
+                        print(f"Warning: Invalid header in {backup_file}: {header}")
+                        continue
+                    
+                    expected_size = struct.unpack('<I', f.read(4))[0]
+                    compressed_data = f.read()
+                    
+                    try:
+                        # Decompress data with explicit size
+                        json_data = lz4.block.decompress(compressed_data, uncompressed_size=expected_size)
+                        if len(json_data) != expected_size:
+                            print(f"Warning: Decompressed size mismatch in {backup_file}")
+                        
+                        # Parse JSON
+                        session_data = json.loads(json_data)
+                        
+                        # Extract URLs from windows and tabs
+                        for window in session_data.get('windows', []):
+                            for tab in window.get('tabs', []):
+                                entries = tab.get('entries', [])
+                                for entry in entries:
+                                    url = entry.get('url', '')
+                                    title = entry.get('title', '')
+                                    last_accessed = entry.get('lastAccessed', 0)  # Timestamp in ms since epoch
+                                    
+                                    # Skip if we've seen this URL or it's in current history
+                                    if url in current_urls or not url or url.startswith('about:'):
+                                        continue
+                                    current_urls.add(url)
+                                    
+                                    # Convert timestamp from ms to microseconds
+                                    visit_time = last_accessed * 1000 if last_accessed else 0
+                                    
+                                    # Create a complete record with all required fields
+                                    record = {
+                                        'browser': 'Firefox',
+                                        'title': f'[RECOVERED FROM SESSION] {title}',
+                                        'url': url,
+                                        'visit_count': 1,
+                                        'visit_time': self.firefox_timestamp_to_datetime(visit_time),
+                                        'tombstone_id': None,
+                                        'generation': None,
+                                        'deletion_time': datetime.now().isoformat(),
+                                        'free_pages': None,
+                                        'free_space_bytes': None,
+                                        'journal_size': None,
+                                        'recovery_status': f'Recovered from {backup_file.name}'
+                                    }
+                                    
+                                    # Only add if we have a valid URL and title
+                                    if url and title:
+                                        print(f"Found deleted history: {url}")
+                                        # Add to deleted history list
+                                        deleted_history.append(record)
+                                        # Print record for debugging
+                                        print(f"Record: {record}")
+                    except lz4.block.LZ4BlockError as e:
+                        print(f"LZ4 decompression error in {backup_file}: {e}")
+                        continue
+                    except json.JSONDecodeError as e:
+                        print(f"JSON parsing error in {backup_file}: {e}")
+                        continue
+                
+                print(f"Processed session backup: {backup_file}")
+                
+            except Exception as e:
+                print(f"Error reading session backup {backup_file}: {e}")
+                continue
+
+        return deleted_history
+
     def extract_firefox_history(self, profile_path):
-        """Extract Firefox browsing history."""
-        places_db = profile_path / "places.sqlite"
-        if not places_db.exists():
-            print(f"Firefox places.sqlite not found: {places_db}")
-            return []
-
-        temp_db = self.output_dir / "firefox_places_temp.db"
-        shutil.copy2(places_db, temp_db)
-
+        """Extract Firefox browsing history using advanced forensics tools if available."""
         history_data = []
-        try:
-            conn = sqlite3.connect(str(temp_db))
-            cursor = conn.cursor()
+        
+        # Try using advanced forensics tools first
+        if FIREFOX_FORENSICS_AVAILABLE:
+            try:
+                forensics = FirefoxForensics(profile_path)
+                
+                # Get regular history
+                places_db = profile_path / "places.sqlite"
+                if places_db.exists():
+                    places_analysis = forensics.analyze_places_database()
+                    if places_analysis and 'deleted_entries' in places_analysis:
+                        for entry in places_analysis['deleted_entries']:
+                            if entry.get('url') and entry.get('title'):
+                                history_data.append({
+                                    'browser': 'Firefox',
+                                    'url': entry['url'],
+                                    'title': entry['title'],
+                                    'visit_count': 1,  # Assume at least one visit
+                                    'visit_time': entry.get('visit_date'),
+                                    'recovery_method': 'forensics_places'
+                                })
+                
+                # Get session history
+                session_history = forensics.parse_session_data()
+                for entry in session_history:
+                    if entry.get('url') and entry.get('title'):
+                        history_data.append({
+                            'browser': 'Firefox',
+                            'url': entry['url'],
+                            'title': entry['title'],
+                            'visit_count': 1,
+                            'visit_time': datetime.fromtimestamp(entry['timestamp'] / 1000) if entry.get('timestamp') else None,
+                            'recovery_method': 'forensics_session'
+                        })
+                
+                logging.info(f"Recovered {len(history_data)} entries using forensics tools")
+                
+            except Exception as e:
+                logging.error(f"Error using forensics tools: {e}")
+                # Fall back to basic extraction
+                logging.info("Falling back to basic extraction method")
+        
+        # If forensics failed or not available, use basic extraction
+        if not history_data:
+            places_db = profile_path / "places.sqlite"
+            if not places_db.exists():
+                logging.warning(f"Firefox places.sqlite not found: {places_db}")
+                return []
 
-            query = """
-            SELECT moz_places.url, moz_places.title, moz_places.visit_count, moz_historyvisits.visit_date
-            FROM moz_places
-            LEFT JOIN moz_historyvisits ON moz_places.id = moz_historyvisits.place_id
-            WHERE moz_historyvisits.visit_date IS NOT NULL
-            ORDER BY moz_historyvisits.visit_date DESC
-            """
+            temp_db = self.output_dir / "firefox_places_temp.db"
+            shutil.copy2(places_db, temp_db)
 
-            cursor.execute(query)
-            rows = cursor.fetchall()
+            try:
+                conn = sqlite3.connect(str(temp_db))
+                cursor = conn.cursor()
 
-            for row in rows:
-                url, title, visit_count, visit_date = row
-                history_data.append({
-                    'browser': 'Firefox',
-                    'url': url,
-                    'title': title or '',
-                    'visit_count': visit_count or 0,
-                    'visit_time': self.firefox_timestamp_to_datetime(visit_date or 0)
-                })
+                # Check if required tables exist
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('moz_places', 'moz_historyvisits')")
+                tables = [row[0] for row in cursor.fetchall()]
 
-            conn.close()
+                if 'moz_places' not in tables:
+                    logging.warning("Firefox places table not found")
+                    conn.close()
+                    return []
 
-        except sqlite3.Error as e:
-            print(f"Error reading Firefox history: {e}")
-        finally:
-            if temp_db.exists():
-                temp_db.unlink()
+                if 'moz_historyvisits' not in tables:
+                    logging.warning("Firefox history visits table not found")
+                    conn.close()
+                    return []
+
+                # Get the latest history entries with their visit dates
+                # Note: Firefox stores visit_date in microseconds since 1970-01-01
+                query = """
+                SELECT p.url, p.title, p.visit_count, h.visit_date
+                FROM moz_places p
+                JOIN moz_historyvisits h ON p.id = h.place_id
+                WHERE h.visit_date IS NOT NULL
+                  AND h.visit_date > strftime('%s', 'now', '-7 days') * 1000000  -- Last week only
+                  AND h.visit_type IN (1, 2)  -- Only direct navigation (1) and link clicks (2)
+                ORDER BY h.visit_date DESC
+                """
+
+                cursor.execute(query)
+                rows = cursor.fetchall()
+
+                for row in rows:
+                    url, title, visit_count, visit_date = row
+                    history_data.append({
+                        'browser': 'Firefox',
+                        'url': url,
+                        'title': title or '',
+                        'visit_count': visit_count or 0,
+                        'visit_time': self.firefox_timestamp_to_datetime(visit_date or 0),
+                        'recovery_method': 'standard'
+                    })
+
+                conn.close()
+            except sqlite3.Error as e:
+                logging.error(f"Error reading Firefox history: {e}")
+            finally:
+                if temp_db.exists():
+                    temp_db.unlink()
 
         return history_data
 
@@ -581,7 +829,7 @@ class BrowserExtractor:
             tombstones = cursor.fetchall()
 
             if tombstones:
-                print(f"Found {len(tombstones)} deleted Safari history records in tombstones")
+                logging.info(f"Found {len(tombstones)} deleted Safari history records in tombstones")
 
             for tombstone in tombstones:
                 tombstone_id, start_time, end_time, url_data, generation = tombstone
@@ -869,8 +1117,10 @@ class BrowserExtractor:
         all_data = {
             'history': [],
             'downloads': [],
-            'cookies': []
+            'cookies': [],
+            'deleted_history': []  # Initialize deleted_history list
         }
+        print("Initialized all_data with empty lists")
 
         # Extract Chrome data
         chrome_path = browser_paths.get('chrome')
@@ -886,25 +1136,72 @@ class BrowserExtractor:
             print("Chrome profile not found, skipping Chrome extraction")
 
         # Extract Firefox data
-        firefox_base = browser_paths.get('firefox')
-        if firefox_base and firefox_base.exists():
-            # Firefox has profile directories, find the default one
+        firefox_path = custom_paths.get('firefox') if custom_paths else self.get_firefox_profile_path()
+        if firefox_path and firefox_path.exists():
             try:
-                profile_dirs = [d for d in firefox_base.iterdir() if d.is_dir() and not d.name.endswith('.default')]
-                if not profile_dirs:
-                    profile_dirs = [d for d in firefox_base.iterdir() if d.is_dir()]
-
-                if profile_dirs:
-                    firefox_path = profile_dirs[0]  # Use first profile
-                    print(f"Extracting Firefox data from: {firefox_path}")
-                    all_data['history'].extend(self.extract_firefox_history(firefox_path))
-                    all_data['cookies'].extend(self.extract_firefox_cookies(firefox_path))
-                else:
-                    print("No Firefox profiles found")
+                logging.info(f"Extracting Firefox data from: {firefox_path}")
+                
+                # Initialize advanced forensics if available
+                forensics_data = None
+                if FIREFOX_FORENSICS_AVAILABLE:
+                    try:
+                        # Use advanced recovery tool
+                        advanced_recovery = AdvancedFirefoxRecovery(firefox_path)
+                        forensics_data = advanced_recovery.recover_all()
+                        logging.info(f"Recovered {len(forensics_data)} entries using advanced forensics")
+                    except Exception as e:
+                        logging.error(f"Error using advanced forensics tools: {e}")
+                        # Fallback to basic forensics
+                        try:
+                            forensics = FirefoxForensics(firefox_path)
+                            forensics_data = forensics.get_all_deleted_history()
+                            logging.info(f"Recovered {len(forensics_data)} entries using basic forensics")
+                        except Exception as e2:
+                            logging.error(f"Error using basic forensics tools: {e2}")
+                
+                # Get regular history
+                regular_history = self.extract_firefox_history(firefox_path)
+                all_data['history'].extend(regular_history)
+                
+                # Process forensics data if available
+                if forensics_data:
+                    current_urls = {item['url'] for item in regular_history}
+                    for item in forensics_data:
+                        if item['url'] not in current_urls and not item['url'].startswith('about:'):
+                            forensic_entry = {
+                                'browser': 'Firefox',
+                                'title': item.get('title', '[Recovered Entry]'),
+                                'url': item['url'],
+                                'visit_count': 1,
+                                'visit_time': None,  # Advanced recovery doesn't provide timestamps
+                                'recovery_method': item.get('recovery_method', 'advanced_forensics'),
+                                'source': 'advanced_recovery_tool'
+                            }
+                            all_data['deleted_history'].append(forensic_entry)
+                
+                # Get session history as backup (only if advanced recovery didn't work)
+                if not forensics_data:
+                    session_history = self.extract_firefox_session_history(firefox_path)
+                    if session_history:
+                        current_urls = {item['url'] for item in regular_history + all_data['deleted_history']}
+                        for item in session_history:
+                            if item['url'] not in current_urls and not item['url'].startswith('about:'):
+                                item['recovery_method'] = 'session_backup'
+                                all_data['deleted_history'].append(item)
+                
+                # Get cookies
+                all_data['cookies'].extend(self.extract_firefox_cookies(firefox_path))
+                
+                # Log recovery statistics
+                logging.info(f"Firefox data recovery complete:")
+                logging.info(f"- Regular history entries: {len(regular_history)}")
+                logging.info(f"- Deleted history entries: {len(all_data['deleted_history'])}")
+                logging.info(f"- Cookie entries: {len(all_data['cookies'])}")
+                
             except Exception as e:
-                print(f"Error extracting Firefox data: {e}")
+                logging.error(f"Error extracting Firefox data: {e}")
         else:
-            print("Firefox profile not found, skipping Firefox extraction")
+            logging.warning("Firefox profile not found, skipping Firefox extraction")
 
         # Extract Safari data (macOS only)
         safari_path = browser_paths.get('safari')
@@ -921,42 +1218,51 @@ class BrowserExtractor:
 
         return all_data
 
-    def save_to_csv(self, data, filename, data_type):
+    def save_to_csv(self, data, filename, data_type, expected_fields=None):
         """Save extracted data to CSV file."""
-        if not data:
-            print(f"No {data_type} data to save")
-            return
-
         output_file = self.output_dir / f"{filename}.csv"
 
-        # Get all unique keys from the data
-        fieldnames = set()
-        for item in data:
-            fieldnames.update(item.keys())
+        # Ensure output directory exists
+        output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        fieldnames = sorted(fieldnames)
+        # Determine fieldnames
+        if expected_fields:
+            fieldnames = expected_fields
+        else:
+            if data_type == 'downloads':
+                fieldnames = ['browser', 'target_path', 'url', 'start_time', 'end_time', 'received_bytes', 'total_bytes', 'danger_type', 'opened']
+            elif data_type == 'cookies':
+                fieldnames = ['browser', 'host_key', 'name', 'value', 'path', 'expires_utc', 'is_secure', 'is_httponly', 'last_access_utc', 'creation_utc']
+            elif data_type == 'deleted':
+                fieldnames = ['browser', 'title', 'url', 'visit_count', 'visit_time', 'tombstone_id', 'generation', 
+                            'deletion_time', 'free_pages', 'free_space_bytes', 'journal_size', 'recovery_status', 
+                            'recovery_method', 'source']
+            else:
+                fieldnames = ['browser', 'title', 'url', 'visit_count', 'visit_time', 'recovery_method']
 
+        # Write data
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            for item in data:
-                # Convert datetime objects to strings
-                row = {}
-                for key, value in item.items():
-                    if isinstance(value, datetime):
-                        row[key] = value.isoformat() if value else ''
-                    else:
-                        row[key] = value
-                writer.writerow(row)
+            if data:
+                for item in data:
+                    # Convert datetime objects to strings and ensure all fields exist
+                    row = {}
+                    for field in fieldnames:
+                        value = item.get(field)
+                        if isinstance(value, datetime):
+                            row[field] = value.isoformat() if value else ''
+                        else:
+                            row[field] = value if value is not None else ''
+                    writer.writerow(row)
 
-        print(f"Saved {len(data)} {data_type} records to {output_file}")
+        if data:
+            print(f"Saved {len(data)} {data_type} records to {output_file}")
+        else:
+            print(f"Created empty {data_type} file: {output_file}")
 
     def save_to_csv_basic_columns(self, data, filename, data_type):
         """Save data to CSV with only basic columns (for regular history)."""
-        if not data:
-            print(f"No {data_type} data to save")
-            return
-
         output_file = self.output_dir / f"{filename}.csv"
 
         # Use only basic columns for regular history
@@ -976,40 +1282,44 @@ class BrowserExtractor:
                             row[key] = item[key]
                 writer.writerow(row)
 
-        print(f"Saved {len(data)} {data_type} records to {output_file}")
+        if data:
+            print(f"Saved {len(data)} {data_type} records to {output_file}")
+        else:
+            print(f"Created empty {data_type} file: {output_file}")
 
     def save_all_data(self, all_data):
         """Save all extracted data to CSV files."""
-        # History saving is now handled in the separation logic above
+        # Save downloads and cookies
         self.save_to_csv(all_data['downloads'], 'browser_downloads', 'downloads')
         self.save_to_csv(all_data['cookies'], 'browser_cookies', 'cookies')
 
-        # Separate regular history from deleted/forensic records
-        regular_history = []
-        deleted_history = []
+        # Save regular history with basic columns
+        self.save_to_csv_basic_columns(all_data['history'], 'browser_history', 'history')
 
-        for item in all_data['history']:
-            if (item.get('title', '').startswith('[DELETED') or
-                item.get('title', '').startswith('[Recovered') or
-                item.get('title', '').startswith('[Encrypted') or
-                item.get('title', '').startswith('[JOURNAL') or
-                item.get('title', '').startswith('[POTENTIAL')):
-                deleted_history.append(item)
-            else:
-                regular_history.append(item)
+        # Save deleted history with all forensic columns (always create file)
+        deleted_fields = ['browser', 'title', 'url', 'visit_count', 'visit_time', 'tombstone_id', 'generation', 'deletion_time', 'free_pages', 'free_space_bytes', 'journal_size', 'recovery_status']
+        deleted_history = all_data.get('deleted_history', [])
+        
+        # Ensure all fields exist in each record
+        for record in deleted_history:
+            for field in deleted_fields:
+                if field not in record:
+                    record[field] = None
+        
+        # Save deleted history
+        self.save_to_csv(deleted_history, 'deleted_browser_history', 'deleted', expected_fields=deleted_fields)
 
-        # Save regular history with basic columns only
-        self.save_to_csv_basic_columns(regular_history, 'browser_history', 'history')
-
-        # Save deleted history with all forensic columns
         if deleted_history:
-            self.save_to_csv(deleted_history, 'deleted_browser_history', 'deleted')
-
             print(f"\n🔍 DELETED HISTORY FOUND:")
             print(f"   📁 {len(deleted_history)} deleted records saved to deleted_browser_history.csv")
+            
+            # Group by type
+            firefox_session = [r for r in deleted_history if r.get('browser') == 'Firefox' and 'recovery_status' in r]
             safari_deleted = [r for r in deleted_history if r.get('browser') == 'Safari' and 'tombstone_id' in r]
             chrome_deleted = [r for r in deleted_history if r.get('browser') == 'Chrome']
 
+            if firefox_session:
+                print(f"   🦊 {len(firefox_session)} Firefox session records recovered")
             if safari_deleted:
                 print(f"   🧭 {len(safari_deleted)} Safari deleted history records (timestamps + encrypted URLs)")
             if chrome_deleted:
@@ -1018,7 +1328,7 @@ class BrowserExtractor:
         # Save summary
         summary = {
             'extraction_timestamp': datetime.now().isoformat(),
-            'total_regular_history_records': len(regular_history),
+            'total_regular_history_records': len(all_data['history']),
             'total_deleted_history_records': len(deleted_history),
             'total_download_records': len(all_data['downloads']),
             'total_cookie_records': len(all_data['cookies']),

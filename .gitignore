@@ -2,3 +2,4 @@ data/raw/*
 data/processed/*
 reports/*
 .DS_Store
+browser_forensics_env
