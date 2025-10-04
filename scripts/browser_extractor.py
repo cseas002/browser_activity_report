@@ -50,7 +50,7 @@ logging.basicConfig(
 class BrowserExtractor:
     """Main class for extracting browser artifacts."""
 
-    def __init__(self, output_dir="data/raw"):
+    def __init__(self, output_dir="../data/raw"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.system = platform.system().lower()
@@ -737,57 +737,137 @@ class BrowserExtractor:
         return downloads_data
 
     def extract_safari_cookies(self, safari_path):
-        """Extract Safari cookies from binary cookies file."""
+        """Extract Safari cookies from SQLite database."""
         cookies_data = []
 
-        # Safari cookies are stored in a sandboxed container
-        cookies_file = Path.home() / "Library" / "Containers" / "com.apple.Safari" / "Data" / "Library" / "Cookies" / "Cookies.binarycookies"
+        # Try SQLite database first (newer Safari versions)
+        cookies_db = Path.home() / "Library" / "Containers" / "com.apple.Safari" / "Data" / "Library" / "Cookies" / "Cookies.db"
+        
+        if cookies_db.exists():
+            print("Found Safari SQLite cookies database")
+            temp_db = self.output_dir / "safari_cookies_temp.db"
+            
+            try:
+                shutil.copy2(cookies_db, temp_db)
+                conn = sqlite3.connect(str(temp_db))
+                cursor = conn.cursor()
 
-        if not cookies_file.exists():
-            print(f"Safari cookies file not found: {cookies_file}")
-            return cookies_data
+                query = """
+                SELECT 
+                    host_key,
+                    name,
+                    value,
+                    path,
+                    expires_utc,
+                    is_secure,
+                    is_httponly,
+                    last_access_utc,
+                    creation_utc
+                FROM cookies
+                ORDER BY creation_utc DESC
+                """
 
-        try:
-            with open(cookies_file, 'rb') as f:
-                # Basic binary cookies parsing
-                # Safari uses a custom binary format, this is a simplified parser
-                data = f.read()
+                cursor.execute(query)
+                rows = cursor.fetchall()
 
-                # Check for magic number (binary cookies start with 'cook')
-                if len(data) < 4 or data[:4] != b'cook':
-                    print("Invalid Safari cookies file format")
-                    return cookies_data
+                for row in rows:
+                    host_key, name, value, path, expires, secure, httponly, last_access, creation = row
+                    cookie = {
+                        'browser': 'Safari',
+                        'host_key': host_key,
+                        'name': name,
+                        'value': value,
+                        'path': path or '/',
+                        'expires_utc': self.safari_timestamp_to_datetime(expires) if expires else None,
+                        'is_secure': bool(secure),
+                        'is_httponly': bool(httponly),
+                        'last_access_utc': self.safari_timestamp_to_datetime(last_access) if last_access else None,
+                        'creation_utc': self.safari_timestamp_to_datetime(creation) if creation else None
+                    }
+                    cookies_data.append(cookie)
 
-                # Parse page size (usually 4096)
-                page_size = int.from_bytes(data[4:8], byteorder='big')
+                conn.close()
 
-                # Parse number of pages
-                num_pages = int.from_bytes(data[8:12], byteorder='big')
+            except sqlite3.Error as e:
+                print(f"SQLite error reading Safari cookies: {e}")
+            except Exception as e:
+                print(f"Error reading Safari cookies database: {e}")
+            finally:
+                if temp_db.exists():
+                    temp_db.unlink()
 
-                print(f"Safari cookies file: {num_pages} pages, page size {page_size}")
+        # If no SQLite database or no cookies found, try binary cookies file
+        if not cookies_data:
+            binary_cookies = Path.home() / "Library" / "Cookies" / "Cookies.binarycookies"
+            
+            if binary_cookies.exists():
+                try:
+                    with open(binary_cookies, 'rb') as f:
+                        data = f.read()
+                        
+                        if len(data) < 4 or data[:4] != b'cook':
+                            print("Invalid Safari binary cookies format")
+                            return cookies_data
 
-                # For now, just report that cookies exist but don't parse the complex binary format
-                # Full parsing would require detailed knowledge of Safari's binary cookie format
-                cookies_data.append({
-                    'browser': 'Safari',
-                    'host_key': 'safari_cookies_binary',
-                    'name': 'binary_cookies_file',
-                    'value': f'Contains {num_pages} pages of cookie data',
-                    'path': '/',
-                    'expires_utc': None,
-                    'is_secure': True,
-                    'is_httponly': True,
-                    'last_access_utc': None,
-                    'creation_utc': None,
-                    'has_expires': False,
-                    'is_persistent': True
-                })
+                        # Parse cookie file structure
+                        page_size = int.from_bytes(data[4:8], byteorder='big')
+                        num_pages = int.from_bytes(data[8:12], byteorder='big')
+                        
+                        # Parse each page
+                        offset = 12
+                        for page in range(num_pages):
+                            try:
+                                # Read page header
+                                if offset + 4 > len(data): break
+                                num_cookies = int.from_bytes(data[offset:offset+4], byteorder='little')
+                                offset += 4
 
-        except (OSError, PermissionError) as e:
-            print(f"Cannot access Safari cookies file: {e}")
-            print("Note: Safari cookies require Full Disk Access permissions on macOS")
-        except Exception as e:
-            print(f"Error reading Safari cookies: {e}")
+                                # Read cookies in this page
+                                for _ in range(num_cookies):
+                                    try:
+                                        # Find null-terminated strings
+                                        def read_string():
+                                            nonlocal offset
+                                            start = offset
+                                            while offset < len(data) and data[offset] != 0:
+                                                offset += 1
+                                            s = data[start:offset].decode('utf-8', errors='ignore')
+                                            offset += 1  # skip null
+                                            return s
+
+                                        # Read cookie fields
+                                        cookie = {
+                                            'browser': 'Safari',
+                                            'host_key': read_string(),
+                                            'name': read_string(),
+                                            'path': read_string(),
+                                            'value': read_string(),
+                                            'is_secure': True,  # Default values
+                                            'is_httponly': True,
+                                            'creation_utc': None,
+                                            'expires_utc': None,
+                                            'last_access_utc': None
+                                        }
+                                        
+                                        # Skip binary flags and timestamps (12 bytes)
+                                        offset += 12
+                                        
+                                        cookies_data.append(cookie)
+
+                                    except Exception as e:
+                                        print(f"Error parsing cookie in page {page}: {e}")
+                                        continue
+
+                            except Exception as e:
+                                print(f"Error parsing page {page}: {e}")
+                                continue
+
+                        print(f"Extracted {len(cookies_data)} cookies from binary cookies file")
+
+                except (OSError, PermissionError) as e:
+                    print(f"Cannot access Safari binary cookies file: {e}")
+                except Exception as e:
+                    print(f"Error reading Safari binary cookies: {e}")
 
         return cookies_data
 
@@ -1345,8 +1425,8 @@ class BrowserExtractor:
 
 def main():
     parser = argparse.ArgumentParser(description='Extract browser artifacts for forensic analysis')
-    parser.add_argument('-o', '--output', default='data/raw',
-                       help='Output directory for extracted data (default: data/raw)')
+    parser.add_argument('-o', '--output', default='../data/raw',
+                       help='Output directory for extracted data (default: ../data/raw)')
     parser.add_argument('-b', '--browsers', nargs='+',
                        choices=['chrome', 'firefox', 'safari', 'edge'],
                        help='Specific browsers to extract from')

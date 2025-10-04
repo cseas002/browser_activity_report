@@ -191,22 +191,26 @@ if [[ "$OS" == "linux" ]]; then
     echo "python -m pip install pandas matplotlib seaborn browserhistory requests beautifulsoup4 lxml"
 fi
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
 # Create necessary directories
 echo "Creating project directories..."
-mkdir -p data/raw
-mkdir -p data/processed
-mkdir -p reports
-mkdir -p tools
-mkdir -p documentation
+mkdir -p "$PROJECT_ROOT/data/raw"
+mkdir -p "$PROJECT_ROOT/data/processed"
+mkdir -p "$PROJECT_ROOT/reports"
+mkdir -p "$PROJECT_ROOT/tools"
+mkdir -p "$PROJECT_ROOT/documentation"
 
 # Make scripts executable
-chmod +x scripts/*.py
-chmod +x scripts/*.sh
+chmod +x "$SCRIPT_DIR"/*.py
+chmod +x "$SCRIPT_DIR"/*.sh
 
 # Copy the test script (created separately to avoid heredoc issues)
 echo "Setting up test script..."
-cp scripts/test_setup_template.py test_setup.py
-chmod +x test_setup.py
+cp "$SCRIPT_DIR/test_setup_template.py" "$PROJECT_ROOT/test_setup.py"
+chmod +x "$PROJECT_ROOT/test_setup.py"
 
 echo ""
 echo "========================================="
@@ -223,11 +227,11 @@ if [[ "$CONDA_PYTHON" == "true" ]]; then
     echo "conda activate $CONDA_DEFAULT_ENV"
     echo ""
     echo "To test your installation, run:"
-    echo "python test_setup.py"
+    echo "python3 test_setup.py"
     echo ""
     echo "Testing installation in Anaconda environment..."
     # Test the installation (simple check)
-    if python -c "import pandas, matplotlib, browserhistory" 2>/dev/null; then
+    if python3 -c "import pandas, matplotlib, browserhistory, lz4" 2>/dev/null; then
         echo "✓ Python packages installed successfully"
     else
         echo "⚠ Package verification failed, but installation completed"
@@ -241,18 +245,18 @@ else
     echo ""
     echo "To test your installation, run:"
     echo "source browser_forensics_env/bin/activate"
-    echo "python test_setup.py"
+    echo "python3 test_setup.py"
     echo ""
     echo "To run the forensics tools:"
     echo "source browser_forensics_env/bin/activate"
-    echo "python scripts/browser_extractor.py"
-    echo "python scripts/analyze_artifacts.py"
-    echo "python scripts/generate_report.py"
+    echo "python3 scripts/browser_extractor.py"
+    echo "python3 scripts/analyze_artifacts.py"
+    echo "python3 scripts/generate_report.py"
     echo ""
     echo "Testing installation in virtual environment..."
     # Test the installation
     source browser_forensics_env/bin/activate
-    if python -c "import pandas, matplotlib, browserhistory" 2>/dev/null; then
+    if python3 -c "import pandas, matplotlib, browserhistory, lz4" 2>/dev/null; then
         echo "✓ Python packages installed successfully"
     else
         echo "⚠ Package verification failed, but installation completed"
@@ -260,8 +264,6 @@ else
 fi
 
 echo ""
-echo "For help with individual scripts, use: python script_name.py --help"
+echo "For help with individual scripts, use: python3 script_name.py --help"
 echo ""
 echo "Documentation is available in the documentation/ directory"
-echo ""
-echo "Happy forensics! 🔍"
