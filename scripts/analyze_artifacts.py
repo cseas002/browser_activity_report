@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 class BrowserAnalyzer:
     """Class for analyzing browser artifacts."""
 
-    def __init__(self, input_dir="data/raw", output_dir="data/processed"):
+    def __init__(self, input_dir="../data/raw", output_dir="../data/processed"):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -577,10 +577,10 @@ class BrowserAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze browser artifacts for forensic insights')
-    parser.add_argument('-i', '--input', default='data/raw',
-                       help='Input directory with extracted data (default: data/raw)')
-    parser.add_argument('-o', '--output', default='data/processed',
-                       help='Output directory for analysis results (default: data/processed)')
+    parser.add_argument('-i', '--input', default='../data/raw',
+                       help='Input directory with extracted data (default: ../data/raw)')
+    parser.add_argument('-o', '--output', default='../data/processed',
+                       help='Output directory for analysis results (default: ../data/processed)')
 
     args = parser.parse_args()
 

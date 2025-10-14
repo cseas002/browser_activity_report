@@ -21,7 +21,7 @@ from collections import defaultdict
 class ForensicReportGenerator:
     """Class for generating forensic reports."""
 
-    def __init__(self, analysis_dir="data/processed", output_dir="reports"):
+    def __init__(self, analysis_dir="../data/processed", output_dir="../reports"):
         self.analysis_dir = Path(analysis_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -531,10 +531,10 @@ DATA PRESERVATION:
 
 def main():
     parser = argparse.ArgumentParser(description='Generate forensic incident report from browser analysis')
-    parser.add_argument('-a', '--analysis', default='data/processed',
-                       help='Analysis data directory (default: data/processed)')
-    parser.add_argument('-o', '--output', default='reports',
-                       help='Output directory for reports (default: reports)')
+    parser.add_argument('-a', '--analysis', default='../data/processed',
+                       help='Analysis data directory (default: ../data/processed)')
+    parser.add_argument('-o', '--output', default='../reports',
+                       help='Output directory for reports (default: ../reports)')
     parser.add_argument('-c', '--case', default='BF-2025-001',
                        help='Case number for the report (default: BF-2025-001)')
     parser.add_argument('-i', '--investigator', default='Browser Forensics Team',

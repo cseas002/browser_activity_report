@@ -3,3 +3,5 @@ data/processed/*
 reports/*
 .DS_Store
 browser_forensics_env
+.venv
+*__pycache__/
