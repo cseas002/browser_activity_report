@@ -115,44 +115,7 @@ echo "Python dependencies installed successfully."
 # Install system tools based on OS
 if [[ "$OS" == "linux" ]]; then
     echo "Installing Linux-specific tools..."
-    
-    # Update package list
-    sudo apt-get update
-    
-    # Install SQLite browser for manual database inspection
-    sudo apt-get install -y sqlitebrowser
-    
-    # Install forensics tools
-    sudo apt-get install -y exiftool
-    
-    # Install Firefox forensics tools
-    echo "Installing Firefox forensics tools..."
-    sudo apt-get install -y sqlite3 mozlz4-tools
-    
-    # Install Rust for additional tools
-    if ! command_exists cargo; then
-        echo "Installing Rust..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source ~/.cargo/env
-    fi
-    
-    # Install firefed (Firefox forensics tool)
-    if ! command_exists firefed; then
-        echo "Installing firefed..."
-        cargo install firefed
-    fi
-    
-    # Install dumpzilla
-    if ! command_exists dumpzilla; then
-        echo "Installing dumpzilla..."
-        sudo apt-get install -y dumpzilla
-    fi
-    
-    # Install development tools
-    sudo apt-get install -y git curl wget
-    
-    echo "Linux tools installed."
-    
+    bash install_firefox_tools.sh
     elif [[ "$OS" == "macos" ]]; then
     echo "Installing macOS-specific tools..."
     

@@ -2,7 +2,26 @@
 
 This folder contains detailed explanations of how the browser forensics tool works.
 
-## Files
+## Main Documentation
+
+### [combined-documentation.md](combined-documentation.md) 📚
+**Complete comprehensive guide** combining all documentation:
+- Complete system overview
+- Data extraction process
+- Analysis methodology
+- Forensic procedures
+- Technical details
+- All browser-specific information
+
+### [firefox-deleted-data-recovery.md](firefox-deleted-data-recovery.md) 🔍
+**Simple explanation** of how Firefox tools find deleted files:
+- How Firefox stores data differently
+- Why Firefox is special for forensics
+- Step-by-step recovery process
+- Why "deleting more shows less"
+- Real-world examples and analogies
+
+## Individual Documentation Files
 
 ### [how-it-works.md](how-it-works.md)
 Complete overview of the system:
