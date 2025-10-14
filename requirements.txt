@@ -1,0 +1,25 @@
+# Browser Forensics Analysis Requirements
+# Core data analysis and visualization
+pandas>=2.0.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.0.0
+
+# Browser history extraction
+browserhistory>=0.1.0
+
+# Web scraping and HTML parsing
+requests>=2.25.0
+beautifulsoup4>=4.9.0
+lxml>=4.6.0
+
+# Firefox forensics
+lz4>=3.1.0
+
+# Report generation
+reportlab>=3.6.0
+markdown>=3.3.0
+
+# Additional utilities
+numpy>=1.21.0
+python-dateutil>=2.8.0
